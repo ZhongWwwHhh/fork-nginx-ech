@@ -130,9 +130,10 @@ int  ngx_ssl_ticket_keys_index;
 int  ngx_ssl_ocsp_index;
 int  ngx_ssl_index;
 int  ngx_ssl_certificate_name_index;
-
-
-u_char  ngx_ssl_session_buffer[NGX_SSL_MAX_SESSION_SIZE];
+int  ngx_ssl_stapling_index;
+#ifdef SSL_R_ECH_REJECTED
+int  ngx_ssl_ech_index;
+#endif
 
 
 ngx_int_t
@@ -271,6 +272,22 @@ ngx_ssl_init(ngx_log_t *log)
         ngx_ssl_error(NGX_LOG_ALERT, log, 0, "X509_get_ex_new_index() failed");
         return NGX_ERROR;
     }
+
+    ngx_ssl_stapling_index = X509_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+
+    if (ngx_ssl_stapling_index == -1) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0, "X509_get_ex_new_index() failed");
+        return NGX_ERROR;
+    }
+
+#ifdef SSL_R_ECH_REJECTED
+    ngx_ssl_ech_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+
+    if (ngx_ssl_ech_index == -1) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0, "X509_get_ex_new_index() failed");
+        return NGX_ERROR;
+    }
+#endif
 
     return NGX_OK;
 }
@@ -438,6 +455,280 @@ ngx_ssl_certificates(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_array_t *certs,
 
     return NGX_OK;
 }
+
+
+#ifdef SSL_R_ECH_REJECTED
+ngx_int_t
+ngx_ssl_ech(ngx_conf_t *cf, ngx_array_t **ech_configs, ngx_str_t *value)
+{
+    ngx_int_t                   config_id;
+    ngx_ssl_ech_conf_t         *ech_config;
+    ngx_uint_t                  i;
+
+    if (ngx_strchr(value[1].data, '/')) {
+        ngx_ssl_error(NGX_LOG_WARN, cf->log, 0,
+                           "public name \"%V\" has suspicious symbols",
+                           &value[1]);
+    }
+
+    config_id = ngx_atoi(value[2].data, value[2].len);
+    if (config_id < 0 || config_id > 255) {
+        ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                      "ECH config_id \"%V\" is invalid. Valid values are between 0 and 255",
+                      &value[2]);
+        return NGX_ERROR;
+    }
+
+    if (*ech_configs == NGX_CONF_UNSET_PTR) {
+        *ech_configs = ngx_array_create(cf->pool, 4, sizeof(ngx_ssl_ech_conf_t));
+        if (ech_configs == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    ech_config = ngx_array_push(*ech_configs);
+    if (ech_config == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(ech_config, sizeof(ngx_ssl_ech_conf_t));
+
+    ech_config->public_name = value[1];
+    ech_config->config_id = config_id;
+
+    for (i = 3; i < cf->args->nelts; i++) {
+        if (ngx_strncmp(value[i].data, "key=", 4) == 0) {
+            ech_config->ech_key.data = value[i].data + 4;
+            ech_config->ech_key.len = value[i].len - 4;
+        } else if (ngx_strcmp(value[i].data, "noretry") == 0) {
+            ech_config->noretry = 1;
+        } else {
+            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                      "unexpected configuration parameter \"%V\"",
+                      &value[i]);
+        return NGX_ERROR;
+        }
+
+    }
+
+    return NGX_OK;
+}
+
+ngx_int_t
+ngx_ssl_prepare_ech(ngx_conf_t *cf, ngx_array_t *ech_configs, ngx_array_t *passwords) {
+    ngx_uint_t                  i;
+    ngx_ssl_ech_conf_t         *ech_config;
+    EVP_PKEY                   *pkey;
+    char                       *err;
+
+    ech_config = ech_configs->elts;
+    for (i = 0; i < ech_configs->nelts; i++) {
+        if (ech_config[i].ech_key.len > 0) {
+            pkey = ngx_ssl_load_certificate_key(cf->pool, &err, &ech_config[i].ech_key, passwords);
+            if (pkey == NULL) {
+                if (err != NULL)
+                {
+                    ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                "cannot load ECH key from \"%V\": %s",
+                                &ech_config[i].ech_key, err);
+                }
+                return NGX_ERROR;
+            }
+            if (EVP_PKEY_id(pkey) != EVP_PKEY_X25519) {
+                ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                            "only X25519 keys supported for ECH");
+                EVP_PKEY_free(pkey);
+                return NGX_ERROR;
+            }
+            if (!EVP_PKEY_get_raw_private_key(pkey, NULL, &ech_config[i].ech_key.len)) {
+                ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                            "cannot not read private key from \"%V\"",
+                            &ech_config[i].ech_key);
+                EVP_PKEY_free(pkey);
+                return NGX_ERROR;
+            }
+            ech_config[i].ech_key.data = ngx_pnalloc(cf->temp_pool, ech_config[i].ech_key.len);
+            if (ech_config[i].ech_key.data == NULL) {
+                EVP_PKEY_free(pkey);
+                return NGX_ERROR;
+            }
+            if (!EVP_PKEY_get_raw_private_key(pkey, ech_config[i].ech_key.data, &ech_config[i].ech_key.len)) {
+                ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                            "cannot not extract private key from \"%V\"",
+                            &ech_config[i].ech_key);
+                EVP_PKEY_free(pkey);
+                return NGX_ERROR;
+            }
+            EVP_PKEY_free(pkey);
+        }
+    }
+
+    return NGX_OK;
+}
+
+ngx_int_t
+ngx_ssl_attach_ech(ngx_conf_t *cf, ngx_array_t *port_ech_configs, ngx_array_t *server_names,
+    ngx_array_t *ssls, ngx_ssl_t *default_ssl)
+{
+    ngx_array_t               **ech_configs;
+    ngx_uint_t                  c, c2, s, s2, found, retry_found, has_keys;
+    EVP_HPKE_KEY               *hpke_key;
+    ngx_str_t                   ech_config, dns_config, *base64_dns_config, **server_name;
+    SSL_ECH_KEYS               *ech_keys;
+    ngx_ssl_ech_conf_t         *configs, *configs2;
+    ngx_ssl_t                 **ssl;
+
+    default_ssl->ech_keys = SSL_ECH_KEYS_new();
+    ech_configs = port_ech_configs->elts;
+    server_name = server_names->elts;
+    ssl = ssls->elts;
+    has_keys = 0;
+
+    for (s = 0; s < port_ech_configs->nelts; s++) {
+        if (ech_configs[s] && ech_configs[s]->nelts > 0) {
+            has_keys = 1;
+            retry_found = 0;
+            ech_keys = SSL_ECH_KEYS_new();
+            configs = ech_configs[s]->elts;
+            for (c = 0; c < ech_configs[s]->nelts; c++) {
+                if (!retry_found && !configs[c].noretry) {
+                    retry_found = 1;
+                }
+                hpke_key = EVP_HPKE_KEY_new();
+                if (hpke_key == NULL) {
+                    ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                "cannot allocate HPKE key");
+                    return NGX_ERROR;
+                }
+                if(!configs[c].ech_key.len) {
+                    for (s2 = 0; s2 < port_ech_configs->nelts; s2++) {
+                        if (s2 == s || !ech_configs[s2]) {
+                            continue;
+                        }
+                        configs2 = ech_configs[s2]->elts;
+                        for (c2 = 0; c2 < ech_configs[s2]->nelts; c2++) {
+                            if (configs[c].config_id == configs2[c2].config_id &&
+                                ngx_strcmp(configs[c].public_name.data,
+                                    configs2[c2].public_name.data) == 0 &&
+                                configs2[c2].ech_key.len > 0) {
+                                configs[c].ech_key.len = configs2[c2].ech_key.len;
+                                configs[c].ech_key.data = configs2[c2].ech_key.data;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if(!configs[c].ech_key.len) {
+                    if (!EVP_HPKE_KEY_generate(hpke_key, EVP_hpke_x25519_hkdf_sha256())) {
+                        ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                    "cannot generate ECH private key");
+                        EVP_HPKE_KEY_free(hpke_key);
+                        return NGX_ERROR;
+                    }
+                    configs[c].ech_key.data = ngx_pnalloc(cf->temp_pool,
+                        EVP_HPKE_MAX_PRIVATE_KEY_LENGTH);
+                    if (configs[c].ech_key.data == NULL) {
+                        EVP_HPKE_KEY_free(hpke_key);
+                        return NGX_ERROR;
+                    }
+                    if (!EVP_HPKE_KEY_private_key(hpke_key, configs[c].ech_key.data,
+                        &configs[c].ech_key.len, EVP_HPKE_MAX_PRIVATE_KEY_LENGTH)) {
+                        ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                    "cannot export generated ECH private key");
+                        EVP_HPKE_KEY_free(hpke_key);
+                        return NGX_ERROR;
+                    }
+                } else {
+                    if (!EVP_HPKE_KEY_init(hpke_key, EVP_hpke_x25519_hkdf_sha256(),
+                        configs[c].ech_key.data, configs[c].ech_key.len)) {
+                        ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                    "cannot import ECH private key");
+                        EVP_HPKE_KEY_free(hpke_key);
+                        return NGX_ERROR;
+                    }
+                }
+
+                if (!SSL_marshal_ech_config(&ech_config.data, &ech_config.len, configs[c].config_id,
+                    hpke_key, (const char*) configs[c].public_name.data, configs[c].public_name.len)) {
+                    ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                    "cannot marshall ECH config");
+                    EVP_HPKE_KEY_free(hpke_key);
+                    return NGX_ERROR;
+                }
+
+                if (!SSL_ECH_KEYS_add(ech_keys, !configs[c].noretry, ech_config.data, ech_config.len,
+                    hpke_key)) {
+                    ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                    "cannot add key to server ECH config");
+                    OPENSSL_free(ech_config.data);
+                    EVP_HPKE_KEY_free(hpke_key);
+                    return NGX_ERROR;
+                }
+
+                found = 0;
+                for (s2 = 0; s2 < s; s2++) {
+                    configs2 = ech_configs[s2]->elts;
+                    for (c2 = 0; c2 < ech_configs[s2]->nelts; c2++) {
+                        if (configs[c].config_id == configs2[c2].config_id &&
+                            ngx_strcmp(configs[c].public_name.data, configs2[c2].public_name.data) == 0 &&
+                            ngx_strcmp(configs[c].ech_key.data, configs2[c2].ech_key.data) == 0) {
+                            found = 1;
+                        }
+                    }
+                }
+                if (!found) {
+                    if (!SSL_ECH_KEYS_add(default_ssl->ech_keys, !configs[c].noretry, ech_config.data,
+                        ech_config.len, hpke_key)) {
+                        ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                        "cannot add key to ECH config");
+                        OPENSSL_free(ech_config.data);
+                        EVP_HPKE_KEY_free(hpke_key);
+                        return NGX_ERROR;
+                    }
+                }
+                OPENSSL_free(ech_config.data);
+                EVP_HPKE_KEY_free(hpke_key);
+            }
+            if (!retry_found) {
+                ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                    "at least one ssl_ech entry without noretry required for server %V", server_name[s]);
+                return NGX_ERROR;
+            }
+            SSL_ECH_KEYS_marshal_retry_configs(ech_keys, &dns_config.data, &dns_config.len);
+            base64_dns_config = ngx_palloc(cf->pool, sizeof(ngx_str_t));
+            if (base64_dns_config == NULL) {
+                return NGX_ERROR;
+            }
+            base64_dns_config->len = ngx_base64_encoded_length(dns_config.len);
+            base64_dns_config->data = ngx_palloc(cf->pool, base64_dns_config->len);
+            if (base64_dns_config->data == NULL) {
+                return NGX_ERROR;
+            }
+            ngx_encode_base64(base64_dns_config, &dns_config);
+            ngx_ssl_error(NGX_LOG_WARN, cf->log, 0, "server %V ECH config for HTTPS DNS record ech=\"%V\"",
+                server_name[s], base64_dns_config);
+            if (SSL_CTX_set_ex_data(ssl[s]->ctx, ngx_ssl_ech_index, base64_dns_config) == 0) {
+                ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                            "SSL_CTX_set_ex_data() failed");
+                return NGX_ERROR;
+            }
+
+            OPENSSL_free(dns_config.data);
+        }
+    }
+
+    if (default_ssl->ctx && has_keys) {
+        if (!SSL_CTX_set1_ech_keys(default_ssl->ctx, default_ssl->ech_keys)) {
+            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                                "could not attach ECH keys to context");
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+#endif
 
 
 ngx_int_t
@@ -658,6 +949,240 @@ retry:
     EVP_PKEY_free(pkey);
 
     return NGX_OK;
+}
+
+
+static X509 *
+ngx_ssl_load_certificate(ngx_pool_t *pool, char **err, ngx_str_t *cert,
+    STACK_OF(X509) **chain)
+{
+    BIO     *bio;
+    X509    *x509, *temp;
+    u_long   n;
+
+    if (ngx_strncmp(cert->data, "data:", sizeof("data:") - 1) == 0) {
+
+        bio = BIO_new_mem_buf(cert->data + sizeof("data:") - 1,
+                              cert->len - (sizeof("data:") - 1));
+        if (bio == NULL) {
+            *err = "BIO_new_mem_buf() failed";
+            return NULL;
+        }
+
+    } else {
+
+        if (ngx_get_full_name(pool, (ngx_str_t *) &ngx_cycle->conf_prefix, cert)
+            != NGX_OK)
+        {
+            *err = NULL;
+            return NULL;
+        }
+
+        bio = BIO_new_file((char *) cert->data, "r");
+        if (bio == NULL) {
+            *err = "BIO_new_file() failed";
+            return NULL;
+        }
+    }
+
+    /* certificate itself */
+
+    x509 = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
+    if (x509 == NULL) {
+        *err = "PEM_read_bio_X509_AUX() failed";
+        BIO_free(bio);
+        return NULL;
+    }
+
+    /* rest of the chain */
+
+    *chain = sk_X509_new_null();
+    if (*chain == NULL) {
+        *err = "sk_X509_new_null() failed";
+        BIO_free(bio);
+        X509_free(x509);
+        return NULL;
+    }
+
+    for ( ;; ) {
+
+        temp = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (temp == NULL) {
+            n = ERR_peek_last_error();
+
+            if (ERR_GET_LIB(n) == ERR_LIB_PEM
+                && ERR_GET_REASON(n) == PEM_R_NO_START_LINE)
+            {
+                /* end of file */
+                ERR_clear_error();
+                break;
+            }
+
+            /* some real error */
+
+            *err = "PEM_read_bio_X509() failed";
+            BIO_free(bio);
+            X509_free(x509);
+            sk_X509_pop_free(*chain, X509_free);
+            return NULL;
+        }
+
+        if (sk_X509_push(*chain, temp) == 0) {
+            *err = "sk_X509_push() failed";
+            BIO_free(bio);
+            X509_free(x509);
+            sk_X509_pop_free(*chain, X509_free);
+            return NULL;
+        }
+    }
+
+    BIO_free(bio);
+
+    return x509;
+}
+
+
+static EVP_PKEY *
+ngx_ssl_load_certificate_key(ngx_pool_t *pool, char **err,
+    ngx_str_t *key, ngx_array_t *passwords)
+{
+    BIO              *bio;
+    EVP_PKEY         *pkey;
+    ngx_str_t        *pwd;
+    ngx_uint_t        tries;
+    pem_password_cb  *cb;
+
+    if (ngx_strncmp(key->data, "engine:", sizeof("engine:") - 1) == 0) {
+
+#ifndef OPENSSL_NO_ENGINE
+
+        u_char  *p, *last;
+        ENGINE  *engine;
+
+        p = key->data + sizeof("engine:") - 1;
+        last = (u_char *) ngx_strchr(p, ':');
+
+        if (last == NULL) {
+            *err = "invalid syntax";
+            return NULL;
+        }
+
+        *last = '\0';
+
+        engine = ENGINE_by_id((char *) p);
+
+        if (engine == NULL) {
+            *err = "ENGINE_by_id() failed";
+            return NULL;
+        }
+
+        *last++ = ':';
+
+        pkey = ENGINE_load_private_key(engine, (char *) last, 0, 0);
+
+        if (pkey == NULL) {
+            *err = "ENGINE_load_private_key() failed";
+            ENGINE_free(engine);
+            return NULL;
+        }
+
+        ENGINE_free(engine);
+
+        return pkey;
+
+#else
+
+        *err = "loading \"engine:...\" certificate keys is not supported";
+        return NULL;
+
+#endif
+    }
+
+    if (ngx_strncmp(key->data, "data:", sizeof("data:") - 1) == 0) {
+
+        bio = BIO_new_mem_buf(key->data + sizeof("data:") - 1,
+                              key->len - (sizeof("data:") - 1));
+        if (bio == NULL) {
+            *err = "BIO_new_mem_buf() failed";
+            return NULL;
+        }
+
+    } else {
+        if (ngx_get_full_name(pool, (ngx_str_t *) &ngx_cycle->conf_prefix, key)
+            != NGX_OK)
+        {
+            *err = NULL;
+            return NULL;
+        }
+
+        bio = BIO_new_file((char *) key->data, "r");
+        if (bio == NULL) {
+            *err = "BIO_new_file() failed";
+            return NULL;
+        }
+    }
+
+    if (passwords) {
+        tries = passwords->nelts;
+        pwd = passwords->elts;
+        cb = ngx_ssl_password_callback;
+
+    } else {
+        tries = 1;
+        pwd = NULL;
+        cb = NULL;
+    }
+
+    for ( ;; ) {
+
+        pkey = PEM_read_bio_PrivateKey(bio, NULL, cb, pwd);
+        if (pkey != NULL) {
+            break;
+        }
+
+        if (tries-- > 1) {
+            ERR_clear_error();
+            (void) BIO_reset(bio);
+            pwd++;
+            continue;
+        }
+
+        *err = "PEM_read_bio_PrivateKey() failed";
+        BIO_free(bio);
+        return NULL;
+    }
+
+    BIO_free(bio);
+
+    return pkey;
+}
+
+
+static int
+ngx_ssl_password_callback(char *buf, int size, int rwflag, void *userdata)
+{
+    ngx_str_t *pwd = userdata;
+
+    if (rwflag) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "ngx_ssl_password_callback() is called for encryption");
+        return 0;
+    }
+
+    if (pwd == NULL) {
+        return 0;
+    }
+
+    if (pwd->len > (size_t) size) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "password is truncated to %d bytes", size);
+    } else {
+        size = pwd->len;
+    }
+
+    ngx_memcpy(buf, pwd->data, size);
+
+    return size;
 }
 
 
@@ -4763,6 +5288,11 @@ ngx_ssl_cleanup_ctx(void *data)
     }
 
     SSL_CTX_free(ssl->ctx);
+#ifdef SSL_R_ECH_REJECTED
+    if (ssl->ech_keys) {
+        SSL_ECH_KEYS_free(ssl->ech_keys);
+    }
+#endif
 }
 
 
@@ -5844,6 +6374,42 @@ ngx_ssl_get_client_v_remain(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 
     X509_free(cert);
 
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_ssl_ech_negotiated(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
+{
+
+    s->len = 0;
+
+#ifdef SSL_R_ECH_REJECTED
+    if (SSL_ech_accepted(c->ssl->connection)) {
+        ngx_str_set(s, "1");
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_ssl_ech_config(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
+{
+    s->len = 0;
+#ifdef SSL_R_ECH_REJECTED
+    ngx_str_t   *ech_config;
+    ech_config = SSL_CTX_get_ex_data(c->ssl->session_ctx, ngx_ssl_ech_index);
+    if (ech_config) {
+        s->len = ech_config->len;
+        s->data = ngx_pnalloc(pool, s->len);
+        if (s->data == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(s->data, ech_config->data, s->len);
+    }
+#endif
     return NGX_OK;
 }
 
