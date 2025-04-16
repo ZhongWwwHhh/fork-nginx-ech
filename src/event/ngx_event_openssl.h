@@ -397,7 +397,4 @@ extern int  ngx_ssl_ech_index;
 extern u_char  ngx_ssl_session_buffer[NGX_SSL_MAX_SESSION_SIZE];
 
 
-extern u_char  ngx_ssl_session_buffer[NGX_SSL_MAX_SESSION_SIZE];
-
-
 #endif /* _NGX_EVENT_OPENSSL_H_INCLUDED_ */

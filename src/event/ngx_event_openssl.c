@@ -139,9 +139,6 @@ int  ngx_ssl_ech_index;
 u_char  ngx_ssl_session_buffer[NGX_SSL_MAX_SESSION_SIZE];
 
 
-u_char  ngx_ssl_session_buffer[NGX_SSL_MAX_SESSION_SIZE];
-
-
 ngx_int_t
 ngx_ssl_init(ngx_log_t *log)
 {
